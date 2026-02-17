@@ -1,0 +1,12 @@
+Practical Ranges (Neural Networks)
+Tabular Data (MLP)
+Typical recommendation:
+Samples	Expected Behavior
+< 500	Very unstable
+500–2000	Risky
+2k–10k	Usable
+10k+	Good
+50k+	Comfortable
+
+
+We typically use MAE to evaluate the performance of a regression model. However, it is not always straightforward to assess how accurate the model is, especially when comparing models trained on different sample sizes, such as 300 versus 500 samples.
