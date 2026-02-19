@@ -1,0 +1,180 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# ----------------------------
+# Config
+# ----------------------------
+LOOKBACK = 8          # how many past months as input
+HORIZON = 3           # how many future months to predict
+BATCH_SIZE = 64
+EPOCHS = 200
+SEED = 42
+
+tf.keras.utils.set_random_seed(SEED)
+
+# ----------------------------
+# 1) Load / prepare data
+# ----------------------------
+# df = pd.read_csv("your_file.csv")  # example
+# Ensure date parses as monthly period
+df = df.copy()
+df["date"] = pd.to_datetime(df["date"], errors="coerce")  # if like 10/2024, works in many cases
+# If your date is "10/2024" exactly, you can use:
+# df["date"] = pd.to_datetime(df["date"], format="%m/%Y")
+
+df["officeId"] = df["officeId"].astype(str)
+
+# Sort properly
+df = df.sort_values(["officeId", "date"]).reset_index(drop=True)
+
+# Feature columns (everything except date/officeId)
+feature_cols = [c for c in df.columns if c not in ["date", "officeId"]]
+num_features = len(feature_cols)
+print("num_features:", num_features)
+
+# ----------------------------
+# 2) Time-based split (global)
+#    Use last 1-2 months for validation across all offices
+# ----------------------------
+all_dates = np.sort(df["date"].dropna().unique())
+if len(all_dates) < (LOOKBACK + HORIZON + 2):
+    raise ValueError("Not enough months overall for chosen LOOKBACK/HORIZON.")
+
+# Example: last 2 months for validation target availability
+# We need enough history before val start for windows.
+val_months = 2
+val_cutoff_date = all_dates[-(val_months + HORIZON)]  # leave room for horizon labels
+# Train: dates < val_cutoff_date, Val: dates >= val_cutoff_date (with proper windowing)
+train_df = df[df["date"] < val_cutoff_date].copy()
+val_df   = df[df["date"] >= val_cutoff_date].copy()
+
+# ----------------------------
+# 3) Scale features using TRAIN ONLY
+# ----------------------------
+scaler = StandardScaler()
+scaler.fit(train_df[feature_cols].values)
+
+def scale_features(d):
+    x = d[feature_cols].values.astype(np.float32)
+    x_scaled = scaler.transform(x).astype(np.float32)
+    d_scaled = d.copy()
+    d_scaled[feature_cols] = x_scaled
+    return d_scaled
+
+train_df = scale_features(train_df)
+val_df   = scale_features(val_df)
+
+# ----------------------------
+# 4) Build sliding windows per office:
+#    X shape: (samples, LOOKBACK, num_features)
+#    y shape: (samples, HORIZON, num_features)
+# ----------------------------
+def make_windows(panel_df: pd.DataFrame, lookback: int, horizon: int, feature_cols):
+    X_list, y_list, meta = [], [], []  # meta holds (officeId, target_start_date)
+    for office_id, g in panel_df.groupby("officeId", sort=False):
+        g = g.sort_values("date")
+        series = g[feature_cols].values.astype(np.float32)  # (T, F)
+        dates = g["date"].values
+        T = len(g)
+        if T < lookback + horizon:
+            continue
+        for start in range(0, T - lookback - horizon + 1):
+            end = start + lookback
+            X_list.append(series[start:end])
+            y_list.append(series[end:end + horizon])
+            meta.append((office_id, dates[end]))  # first predicted month
+    if not X_list:
+        raise ValueError("No windows created. Check lookback/horizon or missing months.")
+    X = np.stack(X_list)  # (N, L, F)
+    y = np.stack(y_list)  # (N, H, F)
+    return X, y, meta
+
+X_train, y_train, meta_train = make_windows(train_df, LOOKBACK, HORIZON, feature_cols)
+X_val,   y_val,   meta_val   = make_windows(pd.concat([train_df, val_df], axis=0), LOOKBACK, HORIZON, feature_cols)
+
+print("X_train:", X_train.shape, "y_train:", y_train.shape)
+print("X_val:", X_val.shape, "y_val:", y_val.shape)
+
+# ----------------------------
+# 5) Create tf.data pipelines
+# ----------------------------
+train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train))
+train_ds = train_ds.shuffle(2048, seed=SEED).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val))
+val_ds = val_ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+# ----------------------------
+# 6) Small NN model (MLP over flattened lookback)
+#    Output predicts all horizon steps + all features
+# ----------------------------
+def build_small_mlp(lookback, num_features, horizon):
+    inp = keras.Input(shape=(lookback, num_features))
+    x = layers.Flatten()(inp)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    x = layers.Dense(32, activation="relu")(x)
+    out = layers.Dense(horizon * num_features)(x)
+    out = layers.Reshape((horizon, num_features))(out)
+    return keras.Model(inp, out)
+
+model = build_small_mlp(LOOKBACK, num_features, HORIZON)
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss=keras.losses.Huber(delta=1.0),
+    metrics=[keras.metrics.MeanAbsoluteError(name="mae")]
+)
+
+callbacks = [
+    keras.callbacks.EarlyStopping(monitor="val_mae", patience=15, restore_best_weights=True),
+    keras.callbacks.ReduceLROnPlateau(monitor="val_mae", factor=0.5, patience=7, min_lr=1e-5),
+]
+
+history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, callbacks=callbacks)
+
+# ----------------------------
+# 7) Forecast next K months per office (recursive)
+#    - Start from the latest LOOKBACK rows for that office
+#    - Predict next 1 month, append, repeat K times
+# ----------------------------
+def forecast_office_recursive(df_scaled_all, office_id, feature_cols, lookback, steps_ahead):
+    g = df_scaled_all[df_scaled_all["officeId"] == office_id].sort_values("date").copy()
+    if len(g) < lookback:
+        raise ValueError(f"Office {office_id} has only {len(g)} rows, need at least {lookback}.")
+    window = g[feature_cols].values.astype(np.float32)[-lookback:]  # (L, F)
+
+    preds_scaled = []
+    for _ in range(steps_ahead):
+        # Model outputs HORIZON steps, take first step for recursion
+        yhat_h = model.predict(window[None, ...], verbose=0)  # (1, H, F)
+        next_step = yhat_h[0, 0, :]  # (F,)
+        preds_scaled.append(next_step)
+        # roll window
+        window = np.vstack([window[1:], next_step[None, :]])
+
+    preds_scaled = np.stack(preds_scaled)  # (K, F)
+    preds_real = scaler.inverse_transform(preds_scaled)  # back to original units
+    return preds_real
+
+# Example: predict next 6 months for each office
+STEPS_AHEAD = 6
+df_scaled_all = scale_features(df)  # scale full df using train scaler
+
+all_forecasts = []
+for office_id in sorted(df["officeId"].unique()):
+    pred_real = forecast_office_recursive(df_scaled_all, office_id, feature_cols, LOOKBACK, STEPS_AHEAD)
+    # Build a nice output table
+    last_date = df[df["officeId"] == office_id]["date"].max()
+    future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=STEPS_AHEAD, freq="MS")
+    out = pd.DataFrame(pred_real, columns=feature_cols)
+    out.insert(0, "date", future_dates)
+    out.insert(1, "officeId", office_id)
+    all_forecasts.append(out)
+
+forecast_df = pd.concat(all_forecasts, ignore_index=True)
+print(forecast_df.head())
+# forecast_df.to_csv("office_forecasts.csv", index=False)
