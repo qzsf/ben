@@ -1,0 +1,406 @@
+## Imports
+
+```python
+import simpy
+import random
+import numpy as np
+```
+
+* `simpy`: the discrete-event simulation library. It provides:
+
+  * `Environment` (the simulation clock + scheduler)
+  * `Resource` / `PriorityResource` (shared capacity like clerks)
+  * `timeout()` (advance simulated time)
+* `random`: Python RNG used for exponential inter-arrival and service times.
+* `numpy`: used only for computing percentiles (p50/p95/p99) cleanly.
+
+---
+
+## Metrics helper
+
+```python
+def summarize_waits(waits, label):
+```
+
+Defines a function to summarize a list of wait times.
+
+```python
+    if len(waits) == 0:
+        return {f"{label}_n": 0}
+```
+
+If there are no customers of this type in the sim run, return count=0.
+
+```python
+    arr = np.array(waits, dtype=float)
+```
+
+Convert the Python list into a NumPy array for easy stats.
+
+```python
+    return {
+        f"{label}_n": len(arr),
+        f"{label}_avg_wait_min": float(arr.mean()),
+        f"{label}_p50_wait_min": float(np.percentile(arr, 50)),
+        f"{label}_p95_wait_min": float(np.percentile(arr, 95)),
+        f"{label}_p99_wait_min": float(np.percentile(arr, 99)),
+    }
+```
+
+Returns:
+
+* number of observations (`n`)
+* average wait time
+* median wait time (p50)
+* p95 and p99 (tail risk is very important in queues)
+
+All wait times are in **minutes** because the simulation’s time unit is minutes.
+
+---
+
+## Customer process
+
+```python
+def customer(env, name, kind, clerks, priority, service_time_sampler, waits_out):
+```
+
+This function is a **SimPy process** (a generator). It models the lifecycle of a single visitor.
+
+Parameters:
+
+* `env`: the simulation environment (provides time + scheduling)
+* `name`: a label like `"appt_123"` (not required for logic, but nice for debugging)
+* `kind`: `"appt"` or `"walkin"`
+* `clerks`: shared resource representing DMV clerks
+* `priority`: appointments get higher priority (lower number)
+* `service_time_sampler`: a function that returns service time in minutes
+* `waits_out`: dict to store wait times by type
+
+```python
+    arrive = env.now
+```
+
+Record the time the customer arrives. `env.now` is the current **simulation clock** time (minutes since start).
+
+```python
+    with clerks.request(priority=priority) as req:
+```
+
+Customer requests a clerk. Because `clerks` is a `PriorityResource`, this request is placed in a queue ordered by:
+
+1. priority (lower number = served sooner)
+2. if same priority, FIFO order
+
+`req` is a SimPy “event” representing the request.
+
+```python
+        yield req
+```
+
+This is crucial: it means “pause this customer process until the request is granted”.
+
+* If a clerk is available now, it resumes immediately.
+* Otherwise, SimPy suspends it until a clerk frees up.
+
+```python
+        start = env.now
+```
+
+Once the request is granted, `env.now` becomes the service start time.
+
+```python
+        waits_out[kind].append(start - arrive)  # minutes
+```
+
+Wait time = time service starts − arrival time.
+
+```python
+        service_time = service_time_sampler(kind)
+```
+
+Sample a service duration (minutes). This is stochastic.
+
+```python
+        yield env.timeout(service_time)
+```
+
+Hold the clerk for `service_time` minutes of simulated time.
+After the timeout finishes, the customer leaves and the `with` block ends, which releases the clerk automatically.
+
+---
+
+## Arrival process (generator of customers)
+
+```python
+def arrival_process(env, kind, clerks, priority, interarrival_sampler, service_time_sampler, waits_out, until):
+```
+
+This is another SimPy process that continuously **creates customers over time**.
+
+Parameters include:
+
+* `interarrival_sampler(kind)`: returns time between arrivals (minutes)
+* `until`: stop time (simulation horizon)
+
+```python
+    i = 0
+```
+
+Counter to name customers.
+
+```python
+    while env.now < until:
+```
+
+Keep generating arrivals until simulation time reaches `until`.
+
+```python
+        i += 1
+```
+
+Increment counter.
+
+```python
+        env.process(customer(
+            env=env,
+            name=f"{kind}_{i}",
+            kind=kind,
+            clerks=clerks,
+            priority=priority,
+            service_time_sampler=service_time_sampler,
+            waits_out=waits_out
+        ))
+```
+
+Start a new customer process immediately at the current time.
+`env.process(...)` schedules that generator with SimPy.
+
+Important: This does **not** block the arrival process. It “fires and forgets”.
+
+```python
+        yield env.timeout(interarrival_sampler(kind))
+```
+
+Wait until the next arrival occurs. This advances simulation time for this arrival process, not necessarily for other processes.
+
+---
+
+## Main simulation runner
+
+```python
+def run_dmv_sim(
+    seed=7,
+    sim_minutes=8*60,
+    num_clerks=6,
+    appt_per_hour=60,
+    walkin_per_hour=30,
+    walkin_multiplier=1.2,
+    mean_service_appt=6.0,
+    mean_service_walkin=6.0,
+    appt_priority=0,
+    walkin_priority=1,
+):
+```
+
+This wraps everything so you can run multiple scenarios easily.
+
+* `sim_minutes=8*60`: simulate 8 hours.
+* `num_clerks`: capacity of clerks.
+* `appt_per_hour`, `walkin_per_hour`: arrival rates.
+* `walkin_multiplier`: policy change (e.g. 1.2 = +20%).
+* mean service times per class.
+* priorities for the queue.
+
+```python
+    random.seed(seed)
+    np.random.seed(seed)
+```
+
+Fix randomness so results are reproducible run-to-run.
+
+```python
+    appt_rate_per_min = appt_per_hour / 60.0
+    walkin_rate_per_min = (walkin_per_hour * walkin_multiplier) / 60.0
+```
+
+Convert arrivals per hour → arrivals per minute.
+
+Example: 60/hour = 1/min.
+
+---
+
+## Interarrival sampler
+
+```python
+    def interarrival_sampler(kind):
+```
+
+This function returns time until next arrival (in minutes).
+
+```python
+        if kind == "appt":
+            rate = appt_rate_per_min
+        else:
+            rate = walkin_rate_per_min
+```
+
+Pick the appropriate rate.
+
+```python
+        return float("inf") if rate <= 0 else random.expovariate(rate)
+```
+
+If rate is 0, infinite time (no arrivals).
+
+Otherwise sample exponential interarrival times:
+
+* Exponential interarrival time → **Poisson arrival process**
+* This is a common first-order assumption in queueing models.
+
+---
+
+## Service time sampler
+
+```python
+    def service_time_sampler(kind):
+```
+
+Returns how long service takes.
+
+```python
+        mean = mean_service_appt if kind == "appt" else mean_service_walkin
+```
+
+Pick mean service time based on class.
+
+```python
+        return random.expovariate(1.0 / mean)
+```
+
+`random.expovariate(lambd)` uses rate parameter `lambd = 1/mean`.
+
+So this gives service times with average `mean`.
+
+(You can later replace with lognormal or empirical bootstrap from data.)
+
+---
+
+## Construct environment and resource
+
+```python
+    env = simpy.Environment()
+```
+
+Creates the simulation world: holds time + event queue.
+
+```python
+    clerks = simpy.PriorityResource(env, capacity=num_clerks)
+```
+
+Creates a shared resource with `num_clerks` identical servers (clerks) and a **priority queue**.
+
+---
+
+## Initialize outputs
+
+```python
+    waits_out = {"appt": [], "walkin": []}
+```
+
+Store wait times separately by customer type.
+
+---
+
+## Start arrival processes
+
+```python
+    env.process(arrival_process(env, "appt", clerks, appt_priority, interarrival_sampler, service_time_sampler, waits_out, sim_minutes))
+    env.process(arrival_process(env, "walkin", clerks, walkin_priority, interarrival_sampler, service_time_sampler, waits_out, sim_minutes))
+```
+
+Start two independent arrival streams:
+
+* appointments arriving over time
+* walk-ins arriving over time
+
+They share the same clerks resource.
+
+---
+
+## Run simulation
+
+```python
+    env.run(until=sim_minutes)
+```
+
+SimPy executes events in time order until the clock reaches `sim_minutes`.
+
+All customers and arrivals are handled through scheduled events.
+
+---
+
+## Summarize and return results
+
+```python
+    results = {}
+    results.update(summarize_waits(waits_out["appt"], "appt"))
+    results.update(summarize_waits(waits_out["walkin"], "walkin"))
+    return results
+```
+
+Compute stats for both classes and return them.
+
+---
+
+## Scenario runner (baseline vs policy)
+
+```python
+if __name__ == "__main__":
+```
+
+This block runs only if you execute the script directly.
+
+```python
+    base = run_dmv_sim(walkin_multiplier=1.0)
+```
+
+Baseline: no increase in walk-ins.
+
+```python
+    newp = run_dmv_sim(walkin_multiplier=1.2)
+```
+
+Policy scenario: +20% walk-ins.
+
+```python
+    print("Baseline:", base)
+    print("Policy +20% walk-ins:", newp)
+```
+
+Print summaries.
+
+---
+
+# Key SimPy concepts you now understand
+
+* **Process**: a generator function that yields events (`customer`, `arrival_process`)
+* **Event**: `req` (resource request), `env.timeout(...)`
+* **Resource**: `PriorityResource` representing clerks
+* **env.now**: current simulated time
+* **yield**: “pause here until the event completes”
+
+---
+
+# Two important caveats (so you don’t get misled)
+
+1. This assumes **Poisson arrivals** and **exponential service time** — good for a first cut, but you should replace with empirical distributions if you can.
+2. Appointment arrivals are modeled as random. In reality, appointments are often **scheduled in blocks** (more deterministic). That can change results a lot.
+
+---
+
+If you want, I can modify the code to be more DMV-realistic:
+
+* appointment schedule by 15-minute slots,
+* walk-in cap per hour,
+* abandonment (people leave if wait > X),
+* multiple service types with different durations.
