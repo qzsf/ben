@@ -1,0 +1,28 @@
+What changed vs the simple version (quick map)
+1) Appointments by 15-minute slot
+appointment_schedule_process(...) spawns exactly slots[i] customers every 15 minutes.
+This matches a real appointment book much better than a Poisson arrival stream.
+2) Walk-in cap per hour
+walkin_caps_per_hour limits how many walk-ins are admitted each hour.
+Anything beyond the cap is counted as rejected_walkins.
+3) Abandonment
+In dmv_customer(...):
+customer requests a clerk (req)
+competes against env.timeout(patience_min)
+if timeout wins, customer abandons and is recorded.
+4) Multiple service types
+service_type_sampler(kind) draws transaction type based on mix for appointment vs walk-in.
+service_time_sampler(service_type, kind) uses lognormal durations with different means by type.
+Practical action plan to make this match your real DMV
+To calibrate to your observed waits (5 min appt, 30 min walk-in):
+Set num_clerks to reality (by hour if possible).
+Set appt_slots to actual appointment book (per 15 mins).
+Set walkin_caps_per_hour to the actual policy limit.
+Tune service_time_params and mix_appt/mix_walkin to match throughput and the 5/30 wait split.
+Tune patience thresholds using abandonment rates (if you have them).
+If you paste your best-guess values for:
+num_clerks
+typical appt_slots for a day (or average appts per 15 minutes)
+walkin_caps_per_hour
+abandonment threshold X (or observed abandonment %)
+…I can show you exactly which parameters to tune first to reproduce 5 min vs 30 min before you run the +20% scenario.
