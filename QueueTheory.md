@@ -108,8 +108,6 @@ If every single DMV customer took exactly 6 minutes and arrived exactly every 6 
 Would you like to explore how adding a single extra clerk (moving from 10 to 11) disproportionately slashes the wait time in these high-stress scenarios?
 
 import numpy as npimport matplotlib.pyplot as plt
-# Simulate a simple M/M/1 queue behavior# Expected number in system L = rho / (1 - rho)rho = np.linspace(0, 0.95, 100)wait_time_factor = rho / (1 - rho)
-
 print(f"Utilization 50%: {0.5 / (1 - 0.5)}")
 print(f"Utilization 90%: {0.9 / (1 - 0.9)}")
 print(f"Utilization 95%: {0.95 / (1 - 0.95)}")
