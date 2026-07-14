@@ -138,5 +138,8 @@ $$W_q = \frac{\rho}{1-\rho} \times \frac{1}{\mu}$$ (Where $1/\mu$ is the average
 * The $\rho$ on top: Represents the demand. More demand = more wait.
 * The $1-\rho$ on the bottom: Represents the "recovery capacity." As your utilization ($\rho$) fills up, your recovery capacity shrinks. When it hits zero, there is nothing left to stop the line from growing forever.
 
-
-
+For a realistic office like the SSA, there is no single math formula that can plug in your parameters and spit out an exact average wait time.
+Erlang assumes that traffic is static and flat. It cannot handle an office traffic pattern that has a massive surge at 9:00 AM and a second peak at lunch, the formula will fail. 
+Both Erlang-C and Erlang-A are statistically flat because their underlying statistical parameters—the Arrival Rate (\(\lambda \)) and the Service Rate (\(\mu \))—are completely constant and fixed over time. 
+Diverse types of cases, ranging from a quick card replacement to a 45-minute disability review, do not work with Erlang equation.
+Instead of trying to compress a chaotic day into a rigid equation, SimPy tracks every event like: single visitor, staff member, customer arrivals, joining queues, services start, end and more individually.
